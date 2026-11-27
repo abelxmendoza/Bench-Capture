@@ -1,6 +1,7 @@
 """python -m capture <command>
 
   devices                          list RealSense cameras (and their USB type)
+  light-check [--seconds N]        live brightness readout: set up lights, practice the flick
   take SESSION [--task T]          record one take (RealSense here; phone + Mac by hand)
   ingest SESSION                   pull Taildrop clips, file them under their takes
   validate SESSION [--take N]      checks -> take_NN/manifest.json, summary.md
@@ -46,6 +47,14 @@ def cmd_devices(a) -> int:
     return 0
 
 
+def cmd_light_check(a) -> int:
+    from . import lightcheck  # noqa: PLC0415
+    print(f"Live RealSense brightness for {a.seconds:.0f}s - aim the camera, adjust the lights, "
+          "practice the flick. Nothing is recorded.\n")
+    s = lightcheck.run(a.seconds, a.width, a.height, a.fps, a.serial)
+    return 0 if s["first_flick"] else 2
+
+
 def cmd_take(a) -> int:
     s = _session(a)
     n = a.take or s.next_take()
@@ -68,7 +77,8 @@ def cmd_take(a) -> int:
         rec.start()
         start = utc_now()
         print(f"RealSense recording -> {bag}  ({rec.device.get('name')}, USB {rec.device.get('usb')})")
-    print("\nNOW: flick the room light OFF and back ON, clap once, then do the task.")
+    print("\nNOW: light flick (lamp off ~1 s then on, or flashlight on ~1 s then off), "
+          "clap once, then do the task.")
     try:
         _wait("Press Enter to stop...", a.duration)
     except KeyboardInterrupt:
@@ -156,6 +166,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("devices").set_defaults(func=cmd_devices)
+
+    lc = sub.add_parser("light-check", help="live brightness readout for setting up lights")
+    lc.add_argument("--seconds", type=float, default=30.0)
+    lc.add_argument("--width", type=int, default=848)
+    lc.add_argument("--height", type=int, default=480)
+    lc.add_argument("--fps", type=int, default=30)
+    lc.add_argument("--serial")
+    lc.set_defaults(func=cmd_light_check)
 
     def with_session(name, func):
         sp = sub.add_parser(name)

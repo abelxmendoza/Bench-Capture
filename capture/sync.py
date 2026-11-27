@@ -1,11 +1,20 @@
 """Find the shared sync events in each stream.
 
-Primary: the light flick. Turning the room light off makes every camera's mean
-brightness fall sharply within one or two frames. The RealSense has no microphone,
-so a visual event is the only one all three streams share.
+Primary: the light flick. Switching a light off (or a flashlight on, in a dark room)
+changes every camera's mean brightness within a frame or two. The RealSense has no
+microphone, so a visual event is the only one all three streams share.
 
-Secondary: the clap, found in the phone and MacBook audio. It cross-checks the
-light-event alignment between those two streams.
+The first qualifying brightness edge in a clip is the sync point, in either
+direction. With "lamp off, then back on", every stream locks to the off edge; with
+"flashlight on, then off" every stream locks to the on edge. Taking the first edge
+rather than the biggest keeps all streams on the same physical event.
+
+The threshold scales with the scene: an edge counts if it changes brightness by at
+least MIN_REL of the brighter level (a small lamp in a dark room still counts), by at
+least MIN_ABS levels (sensor noise in near-black scenes does not), and stands well
+out from ordinary frame-to-frame noise.
+
+Secondary: the clap, found in the phone and MacBook audio, cross-checks alignment.
 """
 from __future__ import annotations
 
@@ -13,62 +22,99 @@ from dataclasses import dataclass
 
 import numpy as np
 
-MIN_DROP = 12.0      # luma levels (0-255) the light-off edge must fall
-MIN_Z = 6.0          # how far the edge stands out from ordinary frame-to-frame noise
+MIN_ABS = 6.0        # luma levels (0-255)
+MIN_REL = 0.20       # fraction of the brighter side of the edge
+MIN_Z = 6.0          # edge size over the clip's frame-to-frame noise (robust sigma)
+DARK = 40.0          # median luma below this: too dark for usable color / hand detection
+BRIGHT = 225.0       # median luma above this: blown out
 
 
 @dataclass
 class Event:
-    t: float          # seconds from the start of the stream
-    strength: float   # z-score of the edge (or clap peak over the noise floor)
-    drop: float = 0.0
+    t: float               # seconds from the start of the stream
+    strength: float        # z-score of the edge (or clap peak over the noise floor)
+    drop: float = 0.0      # absolute brightness change, luma levels
+    direction: str = ""    # "off" (darker) or "on" (brighter); "" for claps
+    rel: float = 0.0       # change as a fraction of the brighter level
 
 
-def light_off_event(t: np.ndarray, y: np.ndarray, window_s: float = 0.25,
-                    search_s: float | None = None) -> Event | None:
-    """Time of the sharpest brightness fall (light off).
+def _steps(y: np.ndarray, k: int):
+    """Median of the k frames after minus median of the k frames before, per frame."""
+    win = np.median(np.lib.stride_tricks.sliding_window_view(y, k), axis=1)  # win[j] = med(y[j:j+k])
+    idx = np.arange(k, len(y) - k + 1)
+    return idx, win[idx - k], win[idx]
 
-    Compares mean brightness just before and just after each frame over `window_s`,
-    so one dark frame from auto-exposure hunting does not count, and a slow fade does
-    not either. `search_s` limits the search to the first N seconds of the clip.
+
+def _sigma(y: np.ndarray, exclude: slice) -> float:
+    noise = np.diff(y)
+    mask = np.ones(len(noise), bool)
+    mask[exclude] = False
+    if not mask.any():
+        return 0.5
+    n = noise[mask]
+    return max(float(np.median(np.abs(n - np.median(n)))) * 1.4826, 0.5)
+
+
+def light_event(t: np.ndarray, y: np.ndarray, window_s: float = 0.25,
+                search_s: float | None = None) -> Event | None:
+    """The first light flick (either direction) in the clip, or None.
+
+    Brightness must stay changed for about `window_s`, so one dark frame from
+    auto-exposure hunting or a hand passing the lens does not count, and a slow fade
+    does not either. `search_s` limits the search to the first N seconds.
     """
     t = np.asarray(t, float)
     y = np.asarray(y, float)
-    if len(t) < 8:
-        return None
-    if search_s is not None:
+    if search_s is not None and len(t):
         keep = t <= t[0] + search_s
         t, y = t[keep], y[keep]
-        if len(t) < 8:
-            return None
-    dt = np.median(np.diff(t)) or 1 / 30
-    k = max(1, int(round(window_s / dt)))
-    idx = np.arange(k, len(y) - k + 1)
+    if len(t) < 8:
+        return None
+    dt = float(np.median(np.diff(t))) or 1 / 30
+    k = max(2, int(round(window_s / dt)))
+    idx, before, after = _steps(y, k)
     if len(idx) == 0:
         return None
-    # Medians, so one dark frame (auto-exposure hunting, a hand over the lens for a
-    # frame) cannot pass for the light going off; the light must stay off ~window_s.
-    win = np.median(np.lib.stride_tricks.sliding_window_view(y, k), axis=1)  # win[j] = y[j:j+k]
-    before = win[idx - k]
-    after = win[idx]
-    step = after - before                      # negative at light-off
-    i = int(np.argmin(step))
-    drop = -float(step[i])
-    noise = np.diff(y)
-    mask = np.ones(len(noise), bool)
-    mask[max(0, idx[i] - 2 * k): idx[i] + 2 * k] = False
-    sigma = float(np.median(np.abs(noise[mask] - np.median(noise[mask])))) * 1.4826 if mask.any() else 0.0
-    sigma = max(sigma, 0.5)
-    # Edge frame: the first frame after `before` that is clearly darker.
-    j0 = idx[i] - k
-    seg = y[j0: idx[i] + k]
-    thresh = before[i] - 0.5 * drop
-    below = np.nonzero(seg < thresh)[0]
-    edge = j0 + int(below[0]) if len(below) else int(idx[i])
-    z = drop / sigma
-    if drop < MIN_DROP or z < MIN_Z:
+    step = after - before
+    mag = np.abs(step)
+    brighter = np.maximum(np.maximum(before, after), 1.0)
+    rel = mag / brighter
+    # Noise from the whole clip, minus the biggest edge, so a flick does not inflate it.
+    big = int(idx[np.argmax(mag)])
+    sigma = _sigma(y, slice(max(0, big - 2 * k), big + 2 * k))
+    ok = (mag >= MIN_ABS) & (rel >= MIN_REL) & (mag / sigma >= MIN_Z)
+    hits = np.nonzero(ok)[0]
+    if len(hits) == 0:
         return None
-    return Event(t=float(t[edge] - t[0]), strength=round(z, 1), drop=round(drop, 1))
+    first = hits[0]
+    # Peak of that edge: the largest change within the next 2k frames of the same sign.
+    sign = np.sign(step[first])
+    span = np.arange(first, min(len(step), first + 2 * k))
+    span = span[np.sign(step[span]) == sign]
+    i = int(span[np.argmax(mag[span])])
+    # Edge frame: first frame past the halfway point between the before/after levels.
+    j0 = int(idx[i] - k)
+    seg = y[j0: idx[i] + k]
+    half = before[i] + 0.5 * step[i]
+    crossed = np.nonzero(seg < half)[0] if sign < 0 else np.nonzero(seg > half)[0]
+    edge = j0 + int(crossed[0]) if len(crossed) else int(idx[i])
+    return Event(t=float(t[edge] - t[0]), strength=round(float(mag[i] / sigma), 1),
+                 drop=round(float(mag[i]), 1), direction="off" if sign < 0 else "on",
+                 rel=round(float(rel[i]), 3))
+
+
+light_off_event = light_event   # backward-compatible name
+
+
+def lighting(y: np.ndarray) -> dict:
+    """Brightness summary of a clip, for the lighting check and the manifest."""
+    y = np.asarray(y, float)
+    if len(y) == 0:
+        return {}
+    med = float(np.median(y))
+    verdict = "too dark" if med < DARK else "blown out" if med > BRIGHT else "ok"
+    return {"median": round(med, 1), "p5": round(float(np.percentile(y, 5)), 1),
+            "p95": round(float(np.percentile(y, 95)), 1), "verdict": verdict}
 
 
 def clap_event(pcm: np.ndarray | None, rate: int, after_s: float = 0.0,

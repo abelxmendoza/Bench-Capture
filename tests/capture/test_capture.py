@@ -274,3 +274,80 @@ def test_cli_take_without_realsense(tmp_path, capsys):
 def test_cli_rejects_unknown_device(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["--root", str(tmp_path), "take", "x", "--devices", "gopro", "--yes", "--duration", "0"])
+
+
+# ---------------------------------------------------------------- lighting variations
+
+def _series(levels, fps=30, noise=0.6, seed=7):
+    """Piecewise-constant brightness: levels = [(seconds, luma), ...]."""
+    rng = np.random.default_rng(seed)
+    y = np.concatenate([np.full(int(s * fps), v, float) for s, v in levels])
+    y += rng.normal(0, noise, len(y))
+    return np.arange(len(y)) / fps, y
+
+
+def test_dark_room_small_lamp_counts():
+    # dim room (46) with a small desk lamp switched off for 1 s -> 34 (26% darker)
+    t, y = _series([(3, 46), (1, 34), (4, 46)])
+    ev = sync.light_event(t, y)
+    assert ev is not None and ev.direction == "off" and abs(ev.t - 3.0) <= 1 / 30 + 1e-9
+    assert ev.rel == pytest.approx(0.26, abs=0.03)
+
+
+def test_flashlight_on_in_dark_room_counts():
+    t, y = _series([(3, 12), (1, 60), (4, 12)])
+    ev = sync.light_event(t, y)
+    assert ev is not None and ev.direction == "on" and abs(ev.t - 3.0) <= 1 / 30 + 1e-9
+
+
+def test_first_edge_wins_off_then_on():
+    # off edge at 2 s is smaller than the on edge at 3 s; all streams must lock to the first one
+    t, y = _series([(2, 120), (1, 80), (3, 200)])
+    ev = sync.light_event(t, y)
+    assert ev.direction == "off" and abs(ev.t - 2.0) <= 1 / 30 + 1e-9
+
+
+def test_near_black_noise_is_not_a_flick():
+    # 4 -> 2 is a 50% change but only 2 levels: sensor noise territory
+    t, y = _series([(3, 4), (1, 2), (3, 4)], noise=0.3)
+    assert sync.light_event(t, y) is None
+
+
+def test_small_relative_change_in_bright_room_is_not_a_flick():
+    # someone walks past: 200 -> 185 (7.5%)
+    t, y = _series([(3, 200), (1, 185), (3, 200)])
+    assert sync.light_event(t, y) is None
+
+
+def test_lighting_summary():
+    assert sync.lighting(np.full(100, 20.0))["verdict"] == "too dark"
+    assert sync.lighting(np.full(100, 240.0))["verdict"] == "blown out"
+    assert sync.lighting(np.full(100, 120.0))["verdict"] == "ok"
+
+
+@needs_ffmpeg
+def test_validate_reports_lighting_and_direction(tmp_path):
+    s = _filled_take(tmp_path)
+    m = validate.validate_take(s, 1, {"bag": fake_bag(), "hands": hands_pass})
+    names = {c["check"]: c for c in m["checks"]}
+    assert names["phone_lighting"]["status"] == "PASS"
+    assert "sync_same_edge" not in names
+    assert m["streams"]["phone"]["light_event"]["direction"] == "off"
+    assert m["streams"]["phone"]["lighting"]["median"] == pytest.approx(150, abs=8)   # codec range shifts it a little
+
+
+@needs_ffmpeg
+def test_mismatched_edges_fail(tmp_path):
+    s = _filled_take(tmp_path)
+
+    def bag_on_edge(path):
+        t, y = _series([(2, 30), (1, 90), (3, 30)])
+        return {"streams": {"depth": {"frames": len(t), "duration_s": 6.0, "expected_frames": len(t),
+                                      "dropped_frames": 0, "drop_rate": 0.0,
+                                      "valid_pixel_fraction_median": 0.7}},
+                "duration_s": 6.0, "light_event": sync.light_event(t, y), "lighting": sync.lighting(y)}
+
+    m = validate.validate_take(s, 1, {"bag": bag_on_edge, "hands": hands_pass})
+    names = {c["check"]: c["status"] for c in m["checks"]}
+    assert names["sync_same_edge"] == "FAIL" and m["verdict"] == "FAIL"
+    assert names["realsense_lighting"] == "WARN"      # median 30: too dark

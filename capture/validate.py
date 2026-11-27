@@ -45,12 +45,13 @@ def _check(name, status, detail, **data):
 def analyze_video(path: Path) -> dict:
     info = media.probe(path)
     t, y = media.luminance(path)
-    ev = sync.light_off_event(t, y, search_s=SEARCH_S)
+    ev = sync.light_event(t, y, search_s=SEARCH_S)
     pcm = media.audio(path, RATE) if info["has_audio"] else None
     clap = sync.clap_event(pcm, RATE, after_s=ev.t if ev else 0.0) if pcm is not None else None
     eff_fps = (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 and t[-1] > t[0] else None
     return {"info": info, "decoded_frames": len(t), "effective_fps": round(eff_fps, 2) if eff_fps else None,
-            "duration_s": round(float(t[-1] - t[0]), 3), "light_event": ev, "clap_event": clap}
+            "duration_s": round(float(t[-1] - t[0]), 3), "light_event": ev, "clap_event": clap,
+            "lighting": sync.lighting(y)}
 
 
 def analyze_bag(path: Path) -> dict:
@@ -58,9 +59,10 @@ def analyze_bag(path: Path) -> dict:
     s = realsense.summarize(realsense.read_bag(path))
     ev = None
     if len(s.color_t):
-        ev = sync.light_off_event(s.color_t, s.color_luma, search_s=SEARCH_S)
+        ev = sync.light_event(s.color_t, s.color_luma, search_s=SEARCH_S)
     dur = s.streams.get("color", s.streams.get("depth", {})).get("duration_s", 0.0)
-    return {"streams": s.streams, "duration_s": dur, "light_event": ev}
+    return {"streams": s.streams, "duration_s": dur, "light_event": ev,
+            "lighting": sync.lighting(s.color_luma)}
 
 
 def hands_check(path: Path, start: float, end: float, n: int = 12):
@@ -147,7 +149,24 @@ def validate_take(session: Session, take: int, analyzers=None) -> dict:
         checks.append(_check("sync_light_flick", "FAIL" if lost else "PASS",
                              f"no light flick found in: {', '.join(lost)} (first {SEARCH_S:.0f}s)"
                              if lost else "light flick found in " +
-                             ", ".join(f"{d} @ {e.t:.3f}s (z={e.strength})" for d, e in events.items())))
+                             ", ".join(f"{d} @ {e.t:.3f}s ({e.direction}, {e.rel:.0%} change, z={e.strength})"
+                                       for d, e in events.items())))
+        dirs = {e.direction for e in events.values() if e}
+        if len(dirs) > 1:
+            checks.append(_check("sync_same_edge", "FAIL",
+                                 "streams locked to different edges ("
+                                 + ", ".join(f"{d}: {e.direction}" for d, e in events.items() if e)
+                                 + "); one camera missed the first flick - redo the take"))
+
+    # 4b. lighting: dark scenes still sync, but color and hand detection suffer
+    for dev, a in streams.items():
+        lt = a.get("lighting") or {}
+        if not lt:
+            continue
+        status = "PASS" if lt["verdict"] == "ok" else "WARN"
+        checks.append(_check(f"{dev}_lighting", status,
+                             f"median brightness {lt['median']:.0f}/255 ({lt['verdict']}; "
+                             f"ok range {sync.DARK:.0f}-{sync.BRIGHT:.0f})"))
 
     # 5. aligned durations after the flick
     tails = {d: a["duration_s"] - events[d].t for d, a in streams.items() if events.get(d)}
@@ -190,7 +209,8 @@ def validate_take(session: Session, take: int, analyzers=None) -> dict:
         e = a.pop("light_event", None)
         c = a.pop("clap_event", None)
         a["sync_offset_s"] = round(e.t, 4) if e else None
-        a["light_event"] = {"t": round(e.t, 4), "z": e.strength, "drop": e.drop} if e else None
+        a["light_event"] = ({"t": round(e.t, 4), "z": e.strength, "drop": e.drop,
+                             "direction": e.direction, "rel": e.rel} if e else None)
         if c:
             a["clap_event"] = {"t": round(c.t, 4), "z": c.strength}
         out_streams[dev] = a
@@ -199,7 +219,8 @@ def validate_take(session: Session, take: int, analyzers=None) -> dict:
         "validated_utc": utc_now(), "session": session.name, "task": session.meta.get("task", ""),
         "take": take, "recorded": record, "streams": out_streams, "checks": checks,
         "verdict": verdict, "warnings": warnings,
-        "alignment": "t=0 is the light-off edge in every stream; subtract sync_offset_s from that stream's time",
+        "alignment": "t=0 is the first light-flick edge in every stream; subtract sync_offset_s "
+                     "from that stream's time",
     }
     session.write(f"take_{take:02d}/manifest.json", manifest)
     return manifest
