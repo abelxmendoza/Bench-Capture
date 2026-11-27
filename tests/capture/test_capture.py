@@ -351,3 +351,14 @@ def test_mismatched_edges_fail(tmp_path):
     names = {c["check"]: c["status"] for c in m["checks"]}
     assert names["sync_same_edge"] == "FAIL" and m["verdict"] == "FAIL"
     assert names["realsense_lighting"] == "WARN"      # median 30: too dark
+
+
+def test_auto_exposure_warmup_is_not_the_flick():
+    # what the D455 really does at start (seen on the Orin): 2 -> 30 -> 45 within 0.6 s,
+    # then steady; the real flick comes at 4 s and must be the one reported
+    t, y = _series([(0.3, 2), (0.3, 30), (3.4, 45), (1, 25), (3, 45)])
+    ev = sync.light_event(t, y)
+    assert ev is not None and ev.direction == "off" and abs(ev.t - 4.0) <= 1 / 30 + 1e-9
+    # and with no flick at all, the warmup alone must not pass the sync check
+    t, y = _series([(0.3, 2), (0.3, 30), (6, 45)])
+    assert sync.light_event(t, y) is None

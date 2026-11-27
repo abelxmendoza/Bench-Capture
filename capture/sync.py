@@ -25,6 +25,7 @@ import numpy as np
 MIN_ABS = 6.0        # luma levels (0-255)
 MIN_REL = 0.20       # fraction of the brighter side of the edge
 MIN_Z = 6.0          # edge size over the clip's frame-to-frame noise (robust sigma)
+SKIP_S = 1.5         # ignore the start of every clip: camera auto-exposure ramps up there
 DARK = 40.0          # median luma below this: too dark for usable color / hand detection
 BRIGHT = 225.0       # median luma above this: blown out
 
@@ -56,17 +57,23 @@ def _sigma(y: np.ndarray, exclude: slice) -> float:
 
 
 def light_event(t: np.ndarray, y: np.ndarray, window_s: float = 0.25,
-                search_s: float | None = None) -> Event | None:
+                search_s: float | None = None, skip_s: float = SKIP_S) -> Event | None:
     """The first light flick (either direction) in the clip, or None.
 
     Brightness must stay changed for about `window_s`, so one dark frame from
     auto-exposure hunting or a hand passing the lens does not count, and a slow fade
-    does not either. `search_s` limits the search to the first N seconds.
+    does not either. `search_s` limits the search to the first N seconds; the first
+    `skip_s` seconds are ignored because every camera's auto-exposure ramps up there.
+    Returned times are still measured from the start of the clip.
     """
     t = np.asarray(t, float)
     y = np.asarray(y, float)
+    t_start = float(t[0]) if len(t) else 0.0
+    if skip_s and len(t):
+        keep = t >= t_start + skip_s
+        t, y = t[keep], y[keep]
     if search_s is not None and len(t):
-        keep = t <= t[0] + search_s
+        keep = t <= t_start + search_s
         t, y = t[keep], y[keep]
     if len(t) < 8:
         return None
@@ -98,7 +105,7 @@ def light_event(t: np.ndarray, y: np.ndarray, window_s: float = 0.25,
     half = before[i] + 0.5 * step[i]
     crossed = np.nonzero(seg < half)[0] if sign < 0 else np.nonzero(seg > half)[0]
     edge = j0 + int(crossed[0]) if len(crossed) else int(idx[i])
-    return Event(t=float(t[edge] - t[0]), strength=round(float(mag[i] / sigma), 1),
+    return Event(t=float(t[edge] - t_start), strength=round(float(mag[i] / sigma), 1),
                  drop=round(float(mag[i]), 1), direction="off" if sign < 0 else "on",
                  rel=round(float(rel[i]), 3))
 

@@ -51,7 +51,7 @@ def cmd_light_check(a) -> int:
     from . import lightcheck  # noqa: PLC0415
     print(f"Live RealSense brightness for {a.seconds:.0f}s - aim the camera, adjust the lights, "
           "practice the flick. Nothing is recorded.\n")
-    s = lightcheck.run(a.seconds, a.width, a.height, a.fps, a.serial)
+    s = lightcheck.run(a.seconds, a.width, a.height, a.fps, a.serial, snapshot=a.snapshot)
     return 0 if s["first_flick"] else 2
 
 
@@ -173,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     lc.add_argument("--height", type=int, default=480)
     lc.add_argument("--fps", type=int, default=30)
     lc.add_argument("--serial")
+    lc.add_argument("--snapshot", help="save a color|depth PNG of what the camera sees, e.g. view.png")
     lc.set_defaults(func=cmd_light_check)
 
     def with_session(name, func):

@@ -19,8 +19,18 @@ def _bar(v: float) -> str:
     return "#" * n + "." * (BAR - n)
 
 
+def save_snapshot(path, color: np.ndarray, depth: np.ndarray) -> bool:
+    """Color frame beside a colorized depth map, as one PNG (needs OpenCV)."""
+    try:
+        import cv2  # noqa: PLC0415
+    except ImportError:
+        return False
+    dep = cv2.applyColorMap(cv2.convertScaleAbs(depth, alpha=0.06), cv2.COLORMAP_JET)
+    return bool(cv2.imwrite(str(path), np.hstack([cv2.cvtColor(color, cv2.COLOR_RGB2BGR), dep])))
+
+
 def run(seconds: float = 30.0, width: int = 848, height: int = 480, fps: int = 30,
-        serial: str | None = None, out=print) -> dict:
+        serial: str | None = None, out=print, snapshot=None) -> dict:
     import pyrealsense2 as rs  # noqa: PLC0415
     pipe, cfg = rs.pipeline(), rs.config()
     if serial:
@@ -31,6 +41,7 @@ def run(seconds: float = 30.0, width: int = 848, height: int = 480, fps: int = 3
     t, y = [], []
     flicks: list[sync.Event] = []
     depth_valid = 0.0
+    last = None
     start = time.time()
     next_print = start
     try:
@@ -46,12 +57,20 @@ def run(seconds: float = 30.0, width: int = 848, height: int = 480, fps: int = 3
             d = fs.get_depth_frame()
             if d and len(t) % 10 == 1:
                 depth_valid = float((np.asanyarray(d.get_data())[::4, ::4] > 0).mean())
+            if snapshot and c and d and len(t) % 15 == 0:
+                last = (np.asanyarray(c.get_data()).copy(), np.asanyarray(d.get_data()).copy())
             if time.time() >= next_print and t:
                 next_print += 0.5
                 mark = ""
                 # look for a flick in the last ~3 s that we have not reported yet
                 w0 = max(0, len(t) - 3 * fps)
-                ev = sync.light_event(np.array(t[w0:]), np.array(y[w0:]))
+                ev = None
+                if now > sync.SKIP_S:      # auto-exposure is still settling before this
+                    t_w, y_w = np.array(t[w0:]), np.array(y[w0:])
+                    keep = t_w >= sync.SKIP_S
+                    ev = sync.light_event(t_w[keep], y_w[keep], skip_s=0) if keep.sum() > 8 else None
+                    if ev is not None:
+                        w0 = int(np.nonzero(np.array(t) >= t_w[keep][0])[0][0])
                 if ev is not None:
                     abs_t = t[w0] + ev.t
                     if not flicks or abs_t - (t[0] + flicks[-1].t) > 1.0:
@@ -68,6 +87,10 @@ def run(seconds: float = 30.0, width: int = 848, height: int = 480, fps: int = 3
                "first_flick": None if whole is None else
                {"t": round(whole.t, 2), "direction": whole.direction, "rel": whole.rel, "z": whole.strength}}
     out("")
+    if snapshot and last is not None:
+        if save_snapshot(snapshot, *last):
+            summary["snapshot"] = str(snapshot)
+            out(f"snapshot (color | depth): {snapshot}")
     out(f"brightness median {lt.get('median', 0):.0f}/255 (p5 {lt.get('p5', 0):.0f}, p95 {lt.get('p95', 0):.0f})"
         f" -> {lt.get('verdict', '?')}")
     if whole:
