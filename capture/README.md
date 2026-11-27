@@ -5,17 +5,17 @@ checks each take before you rely on it as training data.
 
 | Stream | Device | How it starts |
 |---|---|---|
-| depth + color | Intel RealSense D455 on scythe (USB 3) | `python -m capture take` records it |
+| depth + color | Intel RealSense D455 on the recording host (USB 3) | `python -m capture take` records it |
 | first-person view | phone on your chest, 1080p30 wide | you press record |
 | wide third-person view | MacBook webcam (QuickTime) | you press record |
 
-The phone and MacBook are started by hand and send their clips to scythe with
-**Taildrop** (Share → Taildrop → `scythe-1`), so nothing needs SSH access into the Mac.
+The phone and MacBook are started by hand and send their clips to the machine running ingest. For example, use **Taildrop**
+when the devices share a tailnet.
 
 ## A session
 
 ```bash
-cd ~/Desktop/Omega-Code-capture          # or wherever this branch is checked out
+cd ~/Desktop/Bench-Capture               # or wherever this repo is checked out
 source ~/.venvs/capture/bin/activate     # optional: adds mediapipe for the hands check
 
 python -m capture devices                # RealSense found, and on USB 3?
@@ -24,10 +24,11 @@ python -m capture take bench-2026-11-29 --task "sort 5 bolts into 2 trays"
 #  1. start the phone + MacBook recordings, press Enter
 #  2. light OFF for about a second, light back ON, clap once, do the task
 #  3. press Enter to stop; stop the phone + MacBook
-#  4. Taildrop both clips to scythe-1
+#  4. Transfer both clips to the machine running ingest
 # ...repeat `take` for each rep (5 unedited reps)
 
-python -m capture run bench-2026-11-29 --push   # ingest + validate + log to hivemind
+python -m capture ingest bench-2026-11-29
+python -m capture validate bench-2026-11-29
 ```
 
 Sessions live in `~/captures/<session>/` (override with `--root` or `$CAPTURE_ROOT`).
